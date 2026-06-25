@@ -1,0 +1,174 @@
+name: ASTBertX Security Scan
+
+on:
+  push:
+    branches: ["main", "develop"]
+  pull_request:
+    branches: ["main"]
+  schedule:
+    # Weekly full scan every Sunday at 03:00 UTC
+    - cron: "0 3 * * 0"
+
+jobs:
+  # ── Layer 2: CI gate (runs on every PR / push) ──────────────────────────────
+  ci-scan:
+    name: "Layer 2 — CI Gate (BERT+AST)"
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0          # full history needed for git diff
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Cache pip dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: astbertx-${{ hashFiles('**/requirements*.txt') }}
+
+      - name: Install ASTBertX dependencies
+        run: |
+          pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers torch-geometric xgboost scikit-learn \
+                      tree-sitter tree-sitter-languages joblib tqdm
+
+      - name: Download pretrained models
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          python - <<'EOF'
+          from huggingface_hub import snapshot_download
+          snapshot_download("microsoft/graphcodebert-base",
+                            local_dir="BERTAST/LocalModel/graphcodebert-base",
+                            token=None)
+          EOF
+
+      - name: Load trained ASTBertX models
+        # In a real setup, restore from a GitHub Release or artifact.
+        # Here we restore from a cached artifact created by the training workflow.
+        uses: actions/download-artifact@v4
+        with:
+          name: astbertx-models
+          path: BERTAST/output/
+        continue-on-error: true   # graceful: skip scan if models not yet trained
+
+      - name: Run CI scan
+        id: scan
+        run: |
+          python BERTAST/tools/ci_scan.py \
+            --base-path BERTAST \
+            --diff-base origin/${{ github.base_ref || 'main' }} \
+            --mode full \
+            --threshold 0.70 \
+            --report-out astbertx-report.json
+        continue-on-error: true   # capture exit code without failing step
+
+      - name: Upload scan report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: astbertx-ci-report-${{ github.run_number }}
+          path: astbertx-report.json
+          retention-days: 30
+
+      - name: Annotate PR with findings
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('astbertx-report.json')) return;
+            const report = JSON.parse(fs.readFileSync('astbertx-report.json'));
+            const s = report.summary;
+            const body = [
+              '## 🛡 ASTBertX Security Scan',
+              `| Metric | Count |`,
+              `|--------|-------|`,
+              `| ⛔ Threats | **${s.threats}** |`,
+              `| ⚠ Warnings | ${s.warnings} |`,
+              `| ✓ Clean | ${s.clean} |`,
+              `| Total files | ${report.meta.total_files} |`,
+              '',
+              s.threats > 0
+                ? '### Threat details\n' + report.threats.map(t =>
+                    `- \`${t.file}\` → **${t.label}** (${(t.confidence*100).toFixed(0)}%)`
+                  ).join('\n')
+                : '✅ No threats found above threshold.',
+            ].join('\n');
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      - name: Fail if threats found
+        if: steps.scan.outcome == 'failure'
+        run: |
+          echo "ASTBertX detected threats. See report artifact for details."
+          exit 1
+
+  # ── Layer 3: Periodic full-repo scan (weekly) ────────────────────────────────
+  periodic-scan:
+    name: "Layer 3 — Periodic Scan (Legacy + Third-party)"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule'
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: |
+          pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers torch-geometric xgboost scikit-learn \
+                      tree-sitter tree-sitter-languages joblib tqdm
+
+      - name: Restore ASTBertX models
+        uses: actions/download-artifact@v4
+        with:
+          name: astbertx-models
+          path: BERTAST/output/
+        continue-on-error: true
+
+      - name: Run periodic scan (repo + third-party)
+        run: |
+          python BERTAST/tools/periodic_scan.py \
+            --base-path BERTAST \
+            --root . \
+            --include-third-party \
+            --mode full \
+            --threshold 0.65 \
+            --out-dir astbertx_periodic \
+            --workers 4
+
+      - name: Upload periodic report
+        uses: actions/upload-artifact@v4
+        with:
+          name: astbertx-periodic-${{ github.run_number }}
+          path: astbertx_periodic/
+          retention-days: 90
+
+      - name: Notify on findings
+        if: always()
+        env:
+          SLACK_WEBHOOK: ${{ secrets.ASTBERTX_SLACK_WEBHOOK }}
+        run: |
+          REPORT=$(ls astbertx_periodic/last_scan.json 2>/dev/null || echo "")
+          if [ -z "$REPORT" ]; then exit 0; fi
+          THREATS=$(python -c "import json; d=json.load(open('$REPORT')); print(d['summary']['threats'])")
+          if [ "$THREATS" -gt 0 ] && [ -n "$SLACK_WEBHOOK" ]; then
+            python BERTAST/tools/periodic_scan.py \
+              --base-path BERTAST --root . --mode fast --threshold 0.65 \
+              --out-dir /tmp/dummy --webhook "$SLACK_WEBHOOK"
+          fi
