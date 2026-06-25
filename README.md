@@ -13,6 +13,7 @@ Fine-grained detection of multilingual and multi-type exploit scripts has rarely
 
 The two representations are projected into a unified latent space via a two-stage training framework, and fed into an **XGBoost** classifier to produce exploit-type predictions.
 
+---
 
 ## 🗂️ Dataset: Exploit-DB-EX
 
@@ -55,7 +56,7 @@ source venv/bin/activate  # Linux/Mac
 # Install dependencies
 pip install torch torchvision torchaudio
 pip install transformers torch-geometric xgboost scikit-learn
-pip install tree-sitter matplotlib seaborn tqdm joblib
+pip install tree-sitter tree-sitter-languages matplotlib seaborn tqdm joblib
 ```
 
 ### Download Pre-trained Models
@@ -76,12 +77,11 @@ snapshot_download(
 
 ---
 
-## 🚀 Usage
+## 🚀 Training Pipeline
 
 ### Step 1: Prepare Dataset
 
 ```bash
-# Download dataset from Hugging Face
 python -c "
 from datasets import load_dataset
 ds = load_dataset('wwe123/Exploit-DB-EX')
@@ -98,8 +98,8 @@ python bert/train_bert_mlp.py
 ### Step 3: Extract AST-GATv2 Features
 
 ```bash
-python ast/AST.py
-# Output: ast/ast_features.jsonl
+python data/结构树.py
+# Output: cache/ast_features.jsonl, cache/node_type_map.json
 ```
 
 ### Step 4: Train Fusion Model
@@ -107,7 +107,8 @@ python ast/AST.py
 ```bash
 python shellast.py
 # Output: output/fusion_model.pt
-#         output/fusion_enhanced_concat_xgb.pkl
+#         output/graphcodebert_best_xgb.pkl
+#         output/fusion_model_enhanced_concat.pth
 ```
 
 ### Step 5: Evaluate
@@ -116,6 +117,162 @@ Results are automatically saved to `output/` including:
 - Classification report (`.txt`)
 - Confusion matrix (`.png`)
 - Language × category accuracy breakdown (`.csv`)
+
+---
+
+## 🛡️ Three-Layer Defense Pipeline
+
+ASTBertX ships a production-ready defense toolchain built on top of the trained models. Each layer uses the shared `tools/inference_engine.py` backend and targets a different stage of the software development lifecycle.
+
+```
+Developer workstation  →  CI/CD build server  →  Scheduled SAST
+      Layer 1                  Layer 2                Layer 3
+   (pre-commit)           (PR gate / push)        (periodic scan)
+   threshold 0.75          threshold 0.70          threshold 0.65
+   mode: fast              mode: full              mode: full
+```
+
+### Layer 1 — Pre-commit Hook
+
+Blocks commits that contain exploit-like code before they ever enter the repository.
+
+```bash
+# One-command install
+bash BERTAST/tools/install_hooks.sh
+
+# Or copy manually
+cp BERTAST/tools/precommit_hook.py .git/hooks/pre-commit
+chmod +x .git/hooks/pre-commit
+```
+
+Configure via `.astbertx.yml` at the repo root:
+
+```yaml
+precommit:
+  base_path: /abs/path/to/BERTAST
+  confidence_threshold: 0.75   # block if P(threat) >= this
+  block_on_threat: true        # set false to warn-only
+  skip_patterns:
+    - "tests/**"
+    - "*.min.js"
+```
+
+### Layer 2 — CI/CD Gate
+
+Runs on every pull request and push. Scans changed files using the full BERT+AST fusion pipeline and annotates the PR with findings.
+
+```bash
+# Scan files changed vs main
+python BERTAST/tools/ci_scan.py \
+  --base-path BERTAST \
+  --diff-base origin/main \
+  --mode full \
+  --threshold 0.70 \
+  --report-out astbertx-report.json
+```
+
+Exit codes: `0` = clean, `1` = threats found, `2` = configuration error.
+
+The included GitHub Actions workflow (`.github/workflows/astbertx-scan.yml`) wires this up automatically:
+
+```yaml
+# Triggers on every PR targeting main
+- name: Run CI scan
+  run: |
+    python BERTAST/tools/ci_scan.py \
+      --base-path BERTAST \
+      --diff-base origin/${{ github.base_ref || 'main' }} \
+      --mode full \
+      --threshold 0.70 \
+      --report-out astbertx-report.json
+```
+
+### Layer 3 — Periodic Scan
+
+Batch-scans the entire codebase including legacy code and third-party libraries. Designed for weekly cron jobs.
+
+```bash
+# Full scan including third-party dirs
+python BERTAST/tools/periodic_scan.py \
+  --base-path BERTAST \
+  --root . \
+  --include-third-party \
+  --mode full \
+  --threshold 0.65 \
+  --out-dir scan_results \
+  --workers 4
+
+# Incremental scan (only files changed since last run)
+python BERTAST/tools/periodic_scan.py \
+  --base-path BERTAST \
+  --root . \
+  --incremental \
+  --out-dir scan_results
+```
+
+Outputs per run: `scan_YYYYMMDDTHHMMSS.json`, `.csv`, and `.html` (dark-themed interactive report).
+
+The GitHub Actions workflow schedules this automatically every Sunday at 03:00 UTC with optional Slack webhook notification (`ASTBERTX_SLACK_WEBHOOK` secret).
+
+### Inference Engine API
+
+All three layers share a single inference backend:
+
+```python
+from BERTAST.tools.inference_engine import ASTBertXInference
+
+engine = ASTBertXInference(base_path="/path/to/BERTAST")
+
+# Fast mode: BERT-only, ~0.5 s/file after warm-up
+result = engine.predict_fast("exploit.py")
+
+# Full mode: BERT + AST fusion, higher accuracy
+result = engine.predict_full("exploit.py")
+
+# result schema:
+# {
+#   "file": "exploit.py",
+#   "label": "Injection",       # Benign / Overflow / Injection / Denial of Service / File Path
+#   "label_id": 2,
+#   "confidence": 0.91,
+#   "probabilities": {"Benign": 0.02, "Overflow": 0.03, ...},
+#   "is_threat": True,
+#   "mode": "full"
+# }
+```
+
+---
+
+## 📁 Project Structure
+
+```
+ASTBertX/
+├── BERTAST/
+│   ├── bert/               # GraphCodeBERT feature extraction & MLP baseline
+│   ├── data/               # Dataset loaders and AST builder (结构树.py)
+│   ├── modl/               # Model definitions
+│   │   ├── more/
+│   │   │   ├── AST.py              # ASTOnlyModel (GATv2)
+│   │   │   └── Decision_Fusionxgb.py  # EnhancedFusionModel
+│   │   └── ...
+│   ├── tools/              # Defense toolchain
+│   │   ├── inference_engine.py   # Shared prediction backend
+│   │   ├── precommit_hook.py     # Layer 1: pre-commit hook
+│   │   ├── ci_scan.py            # Layer 2: CI/CD gate
+│   │   ├── periodic_scan.py      # Layer 3: batch/SAST scanner
+│   │   └── install_hooks.sh      # One-command hook installer
+│   ├── LocalModel/         # Downloaded pre-trained models
+│   ├── cache/              # node_type_map.json, cached AST features
+│   ├── output/             # Trained model weights & evaluation results
+│   └── shellast.py         # Main training entry point
+├── .github/
+│   └── workflows/
+│       └── astbertx-scan.yml   # CI + periodic scan GitHub Actions
+├── .astbertx.yml           # Unified defense pipeline configuration
+└── .claude/
+    └── commands/
+        └── astbertx.md     # Claude Code skill (/astbertx)
+```
 
 ---
 
