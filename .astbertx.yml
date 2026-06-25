@@ -1,0 +1,23 @@
+# ASTBertX Layered Defense Configuration
+# Run `bash BERTAST/tools/install_hooks.sh` to auto-generate this file.
+
+precommit:
+  base_path: "./BERTAST"          # path to BERTAST/ directory
+  confidence_threshold: 0.75      # block commit if P(threat) >= this
+  block_on_threat: true           # false = warn only (useful during rollout)
+  skip_patterns:
+    - "tests/**"
+    - "test_*.py"
+    - "**/*.min.js"
+    - "docs/**"
+    - "*.md"
+
+ci:
+  mode: full                      # fast (BERT-only) | full (BERT+AST)
+  threshold: 0.70                 # lower than precommit to catch more in CI
+
+periodic:
+  mode: full
+  threshold: 0.65                 # most sensitive for scheduled scans
+  include_third_party: false      # set true to also scan vendor/, node_modules/
+  out_dir: astbertx_scan
